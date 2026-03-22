@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 from threading import Thread
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,7 +17,8 @@ def health():
     return jsonify({"status": "healthy"})
 
 def run_server():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
     logger.info("Starting keep_alive server...")
