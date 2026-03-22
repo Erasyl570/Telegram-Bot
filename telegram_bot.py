@@ -124,7 +124,7 @@ def get_prediction(home, away, league):
 
     try:
 
-        model = genai.GenerativeModel("gemini-1.5-pro")
+        model = genai.GenerativeModel("gemini-2.5-flash")
 
         prompt = f"""
 Ты футбольный аналитик.
