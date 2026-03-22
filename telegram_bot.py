@@ -1,171 +1,101 @@
-"""
-Telegram Bot для футбольных прогнозов
-"""
-
 import os
-import asyncio
+import time
 import logging
 import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from pathlib import Path
-
+from threading import Thread
+from flask import Flask
 import telebot
-from telebot.types import Message
-
 import google.generativeai as genai
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# --- 1. ФЛАСК СЕРВЕР ДЛЯ RENDER (ЧТОБЫ БОТ ЖИЛ МЕСЯЦАМИ) ---
+app = Flask('')
+@app.route('/')
+def home(): 
+    return "Бот работает и готов к прогнозам!"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+def keep_alive():
+    Thread(target=run_flask).start()
+
+# --- 2. НАСТРОЙКА ЛОГОВ И КЛЮЧЕЙ ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Render берет эти ключи из вкладки Environment Variables
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 FOOTBALL_API_KEY = os.getenv('FOOTBALL_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN не найден")
-if not FOOTBALL_API_KEY:
-    raise ValueError("FOOTBALL_API_KEY не найден")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY не найден")
-
-genai.configure(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-try:
-    bot.remove_webhook()
-    logger.info("Webhook removed")
-except Exception as e:
-    logger.warning(f"Could not remove webhook: {e}")
-
-FOOTBALL_API_URL = "https://api.football-data.org/v4"
-
-def get_football_headers():
-    return {"X-Auth-Token": FOOTBALL_API_KEY}
-
-def search_team_matches(team_name: str):
+# --- 3. ПОЛУЧЕНИЕ ПРОГНОЗА ОТ ИИ (GEMINI) ---
+def get_ai_prediction(home, away, league):
+    if not GEMINI_API_KEY:
+        return "⚠️ Ошибка: Ключ Gemini не найден."
+        
     try:
-        competitions = ["PL", "PD", "BL1", "SA", "FL1", "CL", "EL"]
-        team_name_lower = team_name.lower()
-        found_team = None
-        
-        for comp in competitions:
-            try:
-                url = f"{FOOTBALL_API_URL}/competitions/{comp}/teams"
-                response = requests.get(url, headers=get_football_headers(), timeout=10)
-                if response.status_code == 200:
-                    for team in response.json().get("teams", []):
-                        if team_name_lower in team.get("name", "").lower() or \
-                           team_name_lower in team.get("shortName", "").lower():
-                            found_team = team
-                            break
-                if found_team:
-                    break
-            except:
-                continue
-        
-        if not found_team:
-            return None
-        
-        team_id = found_team.get("id")
-        matches_url = f"{FOOTBALL_API_URL}/teams/{team_id}/matches"
-        
-        date_from = datetime.now().strftime("%Y-%m-%d")
-        date_to = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-        
-        params = {"dateFrom": date_from, "dateTo": date_to, "status": "SCHEDULED,TIMED"}
-        response = requests.get(matches_url, headers=get_football_headers(), params=params, timeout=10)
-        
-        if response.status_code != 200:
-            return None
-        
-        matches = response.json().get("matches", [])
-        
-        if not matches:
-            return {"team": found_team, "match": None}
-        
-        return {"team": found_team, "match": matches[0]}
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return None
-
-async def get_ai_prediction(team_a: str, team_b: str, competition: str):
-    try:
+        genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""Ты футбольный эксперт. Проанализируй матч:
-{team_a} vs {team_b}, {competition}
-
-Кратко: кто победит, счёт, почему (1-2 предложения). На русском без специальных значков типо * ."""
+        prompt = f"Ты футбольный эксперт. Проанализируй матч {home} - {away} ({league}). Кто победит и какой примерный счет? Напиши 2 предложения на русском и без значков по типу * ."
         
-        response = await asyncio.wait_for(
-            asyncio.to_thread(model.generate_content, prompt),
-            timeout=15.0
-        )
-        return response.text
-    except:
-        return None
+        # Простой и надежный синхронный запрос
+        response = model.generate_content(prompt)
+        return response.text.replace('*', '').strip()
+    except Exception as e:
+        logger.error(f"Ошибка ИИ: {e}")
+        return "⚠️ Робот-аналитик перегружен. Попробуй еще раз через минуту."
 
+# --- 4. ПОИСК МАТЧЕЙ (БЕЗОПАСНО ДЛЯ БЕСПЛАТНОГО ТАРИФА) ---
+def get_match_data(team_query):
+    headers = {'X-Auth-Token': FOOTBALL_API_KEY}
+    try:
+        # Один безопасный запрос ко всем текущим матчам
+        res = requests.get("https://api.football-data.org/v4/matches", headers=headers, timeout=10).json()
+        matches = res.get('matches', [])
+    except Exception as e:
+        logger.error(f"Ошибка API футбола: {e}")
+        return None, None, None, None
+
+    q = team_query.lower()
+    for m in matches:
+        h, a = m['homeTeam']['name'], m['awayTeam']['name']
+        if q in h.lower() or q in a.lower():
+            return m, h, a, m['homeTeam']['crest']
+    return None, None, None, None
+
+# --- 5. ОБРАБОТКА СООБЩЕНИЙ В ТЕЛЕГРАМЕ ---
 @bot.message_handler(commands=['start', 'help'])
 def handle_start(message):
-    bot.reply_to(message, """👋 Привет! Я бот для футбольных прогнозов.
-
-⚽ Напиши название команды (Barcelona, Chelsea, Bayern) — дам прогноз на ближайший матч.""")
+    bot.reply_to(message, "👋 Привет! Напиши название команды на английском, и я выдам прогноз.")
 
 @bot.message_handler(func=lambda m: True)
 def handle_team_search(message):
-    team_name = message.text.strip()
-    if len(team_name) < 2:
-        bot.reply_to(message, "⚠️ Введите название команды.")
-        return
+    status = bot.reply_to(message, "⏳ Ищу матч в базе данных...")
     
-    msg = bot.reply_to(message, f"🔍 Ищу матчи для '{team_name}'...")
+    match, home, away, crest_url = get_match_data(message.text)
+    
+    if not match:
+        bot.edit_message_text(f"❌ Матчи для '{message.text}' не найдены.", message.chat.id, status.message_id)
+        return
+
+    comp = match['competition']['name']
+    
+    bot.edit_message_text("✅ Матч найден! Генерирую прогноз Gemini (это займет пару секунд)...", message.chat.id, status.message_id)
+    
+    prediction = get_ai_prediction(home, away, comp)
+    text = f"🏟 **Матч:** {home} vs {away}\n🏆 **Лига:** {comp}\n\n🤖 **Прогноз Gemini:**\n{prediction}"
     
     try:
-        match_data = search_team_matches(team_name)
-        
-        if not match_data:
-            bot.edit_message_text(f"❌ Команда '{team_name}' не найдена.", message.chat.id, msg.message_id)
-            return
-        
-        match = match_data.get("match")
-        if not match:
-            bot.edit_message_text("❌ Ближайших матчей не найдено.", message.chat.id, msg.message_id)
-            return
-        
-        home = match["homeTeam"]["name"]
-        away = match["awayTeam"]["name"]
-        comp = match["competition"]["name"]
-        date = match.get("utcDate", "")[:10]
-        
-        bot.edit_message_text("✅ Генерирую прогноз...", message.chat.id, msg.message_id)
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        prediction = loop.run_until_complete(get_ai_prediction(home, away, comp))
-        loop.close()
-        
-        text = f"""⚽ {home} vs {away}
-🏆 {comp}
-📅 {date}
-
-🤖 Прогноз:
-{prediction or "Робот-аналитик взял перерыв, попробуйте снова."}"""
-        
-        bot.edit_message_text(text, message.chat.id, msg.message_id)
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        bot.edit_message_text("❌ Ошибка. Попробуйте позже.", message.chat.id, msg.message_id)
-
-def run_bot():
-    logger.info("Starting bot...")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        bot.send_photo(message.chat.id, crest_url, caption=text, parse_mode='Markdown')
+        bot.delete_message(message.chat.id, status.message_id)
+    except:
+        bot.edit_message_text(text, message.chat.id, status.message_id, parse_mode='Markdown')
 
 if __name__ == "__main__":
-    run_bot()
+    keep_alive()
+    bot.remove_webhook()
+    time.sleep(2)
+    logger.info("✅ БОТ ГОТОВ К РАБОТЕ!")
+    bot.infinity_polling(timeout=20, long_polling_timeout=5)
